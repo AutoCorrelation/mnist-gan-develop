@@ -1,203 +1,168 @@
+"""Compute FID (Fréchet Inception Distance) between two image sets.
+
+This implementation works on Python 3.11 by avoiding torchvision.feature_extraction
+and instead uses a forward hook on Inception's `avgpool` layer to capture
+2048-d features.
+
+Usage:
+  python fid_score.py --path1 path/to/real --path2 path/to/fake --batch-size 32 [--gpu]
+
+Inputs for `--path`: folder of images (.png/.jpg/.jpeg) or a .npz with 'mu' and 'sigma'.
+
+Dependencies: torch, torchvision, numpy, scipy, pillow, tqdm (optional)
 """
-forked from https://github.com/mseitzer/pytorch-fid/blob/master/inception.py
-"""
+
 import os
 import pathlib
-from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
-
+import argparse
 import numpy as np
 import torch
 from scipy import linalg
-from torch.nn.functional import adaptive_avg_pool2d
-
 from PIL import Image
 
 try:
     from tqdm import tqdm
-except ImportError:
-    # If not tqdm is not available, provide a mock version of it
-    def tqdm(x): return x
+except Exception:
+    def tqdm(x):
+        return x
 
-from inception import InceptionV3
-
-def imread(filename):
-    """
-    Loads an image file into a (height, width, 3) uint8 ndarray.
-    """
-    return np.asarray(Image.open(filename), dtype=np.uint8)[..., :3]
+try:
+    from torchvision.models import inception_v3, Inception_V3_Weights
+    from torchvision import transforms
+except Exception:
+    raise RuntimeError('This script requires torchvision with model weights support. Please install/upgrade torchvision.')
 
 
-def get_activations(files, model, batch_size=50, dims=2048,
-                    cuda=False, verbose=False):
-    """Calculates the activations of the pool_3 layer for all images.
-    Params:
-    -- files       : List of image files paths
-    -- model       : Instance of inception model
-    -- batch_size  : Batch size of images for the model to process at once.
-                     Make sure that the number of samples is a multiple of
-                     the batch size, otherwise some samples are ignored. This
-                     behavior is retained to match the original FID score
-                     implementation.
-    -- dims        : Dimensionality of features returned by Inception
-    -- cuda        : If set to True, use GPU
-    -- verbose     : If set to True and parameter out_step is given, the number
-                     of calculated batches is reported.
-    Returns:
-    -- A numpy array of dimension (num images, dims) that contains the
-       activations of the given tensor when feeding inception with the
-       query tensor.
-    """
+def list_images(path):
+    p = pathlib.Path(path)
+    exts = ['*.png', '*.jpg', '*.jpeg']
+    files = []
+    for e in exts:
+        files.extend(sorted(p.glob(e)))
+    return files
+
+
+def image_to_tensor(img_path):
+    img = Image.open(img_path).convert('RGB')
+    transform = transforms.Compose([
+        transforms.Resize((299, 299)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+    return transform(img)
+
+
+def get_inception_model(device='cpu'):
+    # load pretrained inception v3 and switch to eval
+    # Use the weights enum (compatible across torchvision versions)
+    try:
+        weights = Inception_V3_Weights.IMAGENET1K_V1
+    except Exception:
+        # fallback if enum name differs
+        weights = None
+    if weights is not None:
+        model = inception_v3(weights=weights)
+    else:
+        model = inception_v3(pretrained=True)
     model.eval()
-
-    if batch_size > len(files):
-        print(('Warning: batch size is bigger than the data size. '
-               'Setting batch size to data size'))
-        batch_size = len(files)
-
-    pred_arr = np.empty((len(files), dims))
-
-    for i in tqdm(range(0, len(files), batch_size)):
-        if verbose:
-            print('\rPropagating batch %d/%d' % (i + 1, n_batches),
-                  end='', flush=True)
-        start = i
-        end = i + batch_size
-
-        images = np.array([imread(str(f)).astype(np.float32)
-                           for f in files[start:end]])
-
-        # Reshape to (n_images, 3, height, width)
-        images = images.transpose((0, 3, 1, 2))
-        images /= 255
-
-        batch = torch.from_numpy(images).type(torch.FloatTensor)
-        if cuda:
-            batch = batch.cuda()
-
-        pred = model(batch)[0]
-
-        # If model output is not scalar, apply global spatial average pooling.
-        # This happens if you choose a dimensionality not equal 2048.
-        if pred.size(2) != 1 or pred.size(3) != 1:
-            pred = adaptive_avg_pool2d(pred, output_size=(1, 1))
-
-        pred_arr[start:end] = pred.cpu().data.numpy().reshape(pred.size(0), -1)
-
-    if verbose:
-        print(' done')
-
-    return pred_arr
+    model.to(device)
+    return model
 
 
-def calculate_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
-    """Numpy implementation of the Frechet Distance.
-    The Frechet distance between two multivariate Gaussians X_1 ~ N(mu_1, C_1)
-    and X_2 ~ N(mu_2, C_2) is
-            d^2 = ||mu_1 - mu_2||^2 + Tr(C_1 + C_2 - 2*sqrt(C_1*C_2)).
-    Stable version by Dougal J. Sutherland.
-    Params:
-    -- mu1   : Numpy array containing the activations of a layer of the
-               inception net (like returned by the function 'get_predictions')
-               for generated samples.
-    -- mu2   : The sample mean over activations, precalculated on an
-               representative data set.
-    -- sigma1: The covariance matrix over activations for generated samples.
-    -- sigma2: The covariance matrix over activations, precalculated on an
-               representative data set.
-    Returns:
-    --   : The Frechet Distance.
-    """
+def get_activations(files, model, batch_size=50, device='cpu'):
+    """Get 2048-d activations from inception avgpool via forward hook."""
+    model.eval()
+    n_files = len(files)
+    act = np.empty((n_files, 2048), dtype=np.float32)
 
-    mu1 = np.atleast_1d(mu1)
-    mu2 = np.atleast_1d(mu2)
+    # hook to capture avgpool output
+    activations = []
+    def _hook(module, input, output):
+        # output shape (N, 2048, 1, 1)
+        activations.append(output.detach().cpu())
 
-    sigma1 = np.atleast_2d(sigma1)
-    sigma2 = np.atleast_2d(sigma2)
+    handle = model.avgpool.register_forward_hook(_hook)
 
-    assert mu1.shape == mu2.shape, \
-        'Training and test mean vectors have different lengths'
-    assert sigma1.shape == sigma2.shape, \
-        'Training and test covariances have different dimensions'
+    try:
+        for i in tqdm(range(0, n_files, batch_size)):
+            batch_files = files[i:i+batch_size]
+            tensors = [image_to_tensor(str(f)) for f in batch_files]
+            batch = torch.stack(tensors, dim=0).to(device)
+            activations.clear()
+            with torch.no_grad():
+                _ = model(batch)  # forward; hook populates `activations`
+            if len(activations) == 0:
+                raise RuntimeError('Failed to capture activations from Inception model')
+            out = activations[0]  # tensor shape (N,2048,1,1)
+            out = out.reshape(out.size(0), -1).cpu().numpy()
+            act[i:i+out.shape[0]] = out
+    finally:
+        handle.remove()
 
-    diff = mu1 - mu2
-
-    # Product might be almost singular
-    covmean, _ = linalg.sqrtm(sigma1.dot(sigma2), disp=False)
-    if not np.isfinite(covmean).all():
-        msg = ('fid calculation produces singular product; '
-               'adding %s to diagonal of cov estimates') % eps
-        print(msg)
-        offset = np.eye(sigma1.shape[0]) * eps
-        covmean = linalg.sqrtm((sigma1 + offset).dot(sigma2 + offset))
-
-    # Numerical error might give slight imaginary component
-    if np.iscomplexobj(covmean):
-        if not np.allclose(np.diagonal(covmean).imag, 0, atol=1e-3):
-            m = np.max(np.abs(covmean.imag))
-            raise ValueError('Imaginary component {}'.format(m))
-        covmean = covmean.real
-
-    tr_covmean = np.trace(covmean)
-
-    return (diff.dot(diff) + np.trace(sigma1) +
-            np.trace(sigma2) - 2 * tr_covmean)
+    return act
 
 
-def calculate_activation_statistics(files, model, batch_size=50,
-                                    dims=2048, cuda=False, verbose=False):
-    """Calculation of the statistics used by the FID.
-    Params:
-    -- files       : List of image files paths
-    -- model       : Instance of inception model
-    -- batch_size  : The images numpy array is split into batches with
-                     batch size batch_size. A reasonable batch size
-                     depends on the hardware.
-    -- dims        : Dimensionality of features returned by Inception
-    -- cuda        : If set to True, use GPU
-    -- verbose     : If set to True and parameter out_step is given, the
-                     number of calculated batches is reported.
-    Returns:
-    -- mu    : The mean over samples of the activations of the pool_3 layer of
-               the inception model.
-    -- sigma : The covariance matrix of the activations of the pool_3 layer of
-               the inception model.
-    """
-    act = get_activations(files, model, batch_size, dims, cuda, verbose)
+def calculate_activation_statistics(files, model, batch_size=50, device='cpu'):
+    act = get_activations(files, model, batch_size, device)
     mu = np.mean(act, axis=0)
     sigma = np.cov(act, rowvar=False)
     return mu, sigma
 
 
-def _compute_statistics_of_path(path, model, batch_size, dims, cuda):
+def _compute_statistics_of_path(path, model, batch_size, device):
     if path.endswith('.npz'):
         f = np.load(path)
         m, s = f['mu'][:], f['sigma'][:]
         f.close()
     else:
-        path = pathlib.Path(path)
-        files = list(path.glob('*.jpg')) + list(path.glob('*.png'))
-        m, s = calculate_activation_statistics(files, model, batch_size,
-                                               dims, cuda)
-
+        files = list_images(path)
+        if len(files) == 0:
+            raise RuntimeError(f'No images found in {path}')
+        m, s = calculate_activation_statistics(files, model, batch_size, device)
     return m, s
 
 
-def calculate_fid_given_paths(paths, batch_size, cuda, dims=2048):
-    """Calculates the FID of two paths"""
+def calculate_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
+    mu1 = np.atleast_1d(mu1)
+    mu2 = np.atleast_1d(mu2)
+    sigma1 = np.atleast_2d(sigma1)
+    sigma2 = np.atleast_2d(sigma2)
+    assert mu1.shape == mu2.shape
+    assert sigma1.shape == sigma2.shape
+    diff = mu1 - mu2
+    covmean, _ = linalg.sqrtm(sigma1.dot(sigma2), disp=False)
+    if not np.isfinite(covmean).all():
+        offset = np.eye(sigma1.shape[0]) * eps
+        covmean = linalg.sqrtm((sigma1 + offset).dot(sigma2 + offset))
+    if np.iscomplexobj(covmean):
+        covmean = covmean.real
+    tr_covmean = np.trace(covmean)
+    return diff.dot(diff) + np.trace(sigma1) + np.trace(sigma2) - 2 * tr_covmean
+
+
+def calculate_fid_given_paths(paths, batch_size, device='cpu'):
     for p in paths:
         if not os.path.exists(p):
             raise RuntimeError('Invalid path: %s' % p)
 
-    block_idx = InceptionV3.BLOCK_INDEX_BY_DIM[dims]
-
-    model = InceptionV3([block_idx])
-    if cuda:
-        model.cuda()
-
-    m1, s1 = _compute_statistics_of_path(paths[0], model, batch_size,
-                                         dims, cuda)
-    m2, s2 = _compute_statistics_of_path(paths[1], model, batch_size,
-                                         dims, cuda)
+    model = get_inception_model(device)
+    m1, s1 = _compute_statistics_of_path(paths[0], model, batch_size, device)
+    m2, s2 = _compute_statistics_of_path(paths[1], model, batch_size, device)
     fid_value = calculate_frechet_distance(m1, s1, m2, s2)
-
     return fid_value
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='Compute FID between two folders of images or .npz stats')
+    parser.add_argument('--path1', required=True, help='Path to real images or .npz')
+    parser.add_argument('--path2', required=True, help='Path to generated images or .npz')
+    parser.add_argument('--batch-size', type=int, default=32)
+    parser.add_argument('--gpu', action='store_true', help='use GPU')
+    return parser.parse_args()
+
+
+if __name__ == '__main__':
+    args = parse_args()
+    device = 'cuda' if args.gpu and torch.cuda.is_available() else 'cpu'
+    fid_value = calculate_fid_given_paths([args.path1, args.path2], args.batch_size, device)
+    print(f'FID: {fid_value:.6f}')
